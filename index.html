@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Radiologist's GNN Assistant</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; height: 95vh; margin: 0; }
+        .container { display: flex; width: 100%; }
+        .panel { flex: 1; padding: 20px; border-left: 1px solid #ccc; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
+        #analysis-panel { border-left: none; }
+        #chat-panel { background-color: #f9f9f9; }
+        #chat-window { flex-grow: 1; border: 1px solid #ccc; background: #fff; padding: 10px; overflow-y: scroll; margin-bottom: 10px; }
+        .message { margin-bottom: 10px; padding: 8px; border-radius: 5px; max-width: 80%; }
+        .user { background-color: #d1e7fd; align-self: flex-end; text-align: right; }
+        .bot { background-color: #e2e3e5; align-self: flex-start; }
+        #chat-input-box { display: flex; }
+        #user-input { flex-grow: 1; padding: 8px; }
+        #analysis-results { text-align: center; }
+        #mri-image-display { max-width: 100%; border: 1px solid #ddd; }
+        #gnn-summary-display { font-family: monospace; text-align: left; background: #eee; padding: 10px; border-radius: 5px; white-space: pre-wrap; }
+        #loader { display: none; text-align: center; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="panel" id="analysis-panel">
+            <h2>1. GNN Analysis</h2>
+            <p>Upload a 3D FLAIR MRI file (.nii or .nii.gz) to begin.</p>
+            <input type="file" id="nii-upload" accept=".nii,.nii.gz">
+            <button onclick="analyzeMRI()" id="analyze-btn" style="margin-top: 10px;">Analyze MRI</button>
+            
+            <div id="loader">
+                <p>Analyzing MRI... This may take a minute. Please wait.</p>
+            </div>
+
+            <div id="analysis-results" style="display:none; margin-top: 20px;">
+                <h3>Analysis Results</h3>
+                <img id="mri-image-display" src="" alt="2D MRI Slice">
+                <p><small>Best 2D Slice (for LLaVA)</small></p>
+                <h4>GNN Segmentation Summary</h4>
+                <div id="gnn-summary-display"></div>
+            </div>
+        </div>
+
+        <div class="panel" id="chat-panel">
+            <h2>2. LLaVA Chat Assistant</h2>
+            <div id="chat-window">
+                <div class="message bot">Please analyze an MRI in Panel 1 to activate the chat.</div>
+            </div>
+            <div id="chat-input-box">
+                <input type="text" id="user-input" placeholder="Type your message..." disabled>
+                <button onclick="sendMessage()" id="send-btn" disabled>Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variable to store results from the GNN
+        let gnn_analysis_results = null;
+
+        async function analyzeMRI() {
+            const fileInput = document.getElementById('nii-upload');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert("Please select a .nii or .nii.gz file.");
+                return;
+            }
+
+            // Show loader and disable button
+            document.getElementById('loader').style.display = 'block';
+            document.getElementById('analysis-results').style.display = 'none';
+            document.getElementById('analyze-btn').disabled = true;
+
+            const formData = new FormData();
+            formData.append('mri_file', file);
+
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.error || 'Analysis failed.');
+                }
+
+                const data = await response.json();
+
+                // Store results globally
+                gnn_analysis_results = {
+                    summary: data.summary,
+                    image_b64: data.image_b64
+                };
+
+                // Display results
+                document.getElementById('mri-image-display').src = 'data:image/png;base64,' + data.image_b64;
+                document.getElementById('gnn-summary-display').innerText = data.summary.replace(/\\*\\*/g, ''); // Clean up markdown
+                document.getElementById('analysis-results').style.display = 'block';
+
+                // Activate chat
+                document.getElementById('user-input').disabled = false;
+                document.getElementById('send-btn').disabled = false;
+                displayMessage('Bot', 'Analysis complete. You can now ask questions about this scan.');
+
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                // Hide loader and re-enable button
+                document.getElementById('loader').style.display = 'none';
+                document.getElementById('analyze-btn').disabled = false;
+            }
+        }
+
+        async function sendMessage() {
+            const userInput = document.getElementById('user-input').value;
+            if (!userInput) return;
+            
+            if (!gnn_analysis_results) {
+                alert("Please analyze an MRI first.");
+                return;
+            }
+
+            displayMessage('You', userInput);
+            document.getElementById('user-input').value = ''; // Clear input
+
+            await sendToBackend(userInput, gnn_analysis_results.image_b64, gnn_analysis_results.summary);
+        }
+
+        async function sendToBackend(message, imageB64, summary) {
+            const chatWindow = document.getElementById('chat-window');
+            // Add "Thinking..." message
+            const thinkingMessage = document.createElement('div');
+            thinkingMessage.classList.add('message', 'bot');
+            thinkingMessage.innerText = 'Bot: Thinking...';
+            chatWindow.appendChild(thinkingMessage);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: message,
+                        image: imageB64,
+                        summary: summary // Send the summary to the backend
+                    })
+                });
+
+                const data = await response.json();
+                thinkingMessage.remove(); // Remove "Thinking..."
+
+                if (data.reply) {
+                    displayMessage('Bot', data.reply);
+                } else if (data.error) {
+                    displayMessage('Bot', `Error: ${data.error}`);
+                }
+            } catch (error) {
+                thinkingMessage.remove(); // Remove "Thinking..."
+                displayMessage('Bot', 'Error connecting to the server.');
+            }
+        }
+
+        function displayMessage(sender, text) {
+            const chatWindow = document.getElementById('chat-window');
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', sender.toLowerCase());
+            
+            // Simple text formatting
+            text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>'); // Bold
+            text = text.replace(/\n/g, '<br>'); // Newlines
+            
+            messageDiv.innerHTML = `<strong>${sender}:</strong> ${text}`;
+            chatWindow.appendChild(messageDiv);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+    </script>
+</body>
+</html>
+
+
+
+
+
+
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Upload & Processing</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f4f4f4;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+        input[type="file"] {
+            margin: 10px 0;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            background: #dff0d8;
+            border: 1px solid #d0e9c6;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Upload a File for Processing</h2>
+        <form id="uploadForm" enctype="multipart/form-data">
+            <input type="file" name="file" id="fileInput" accept="image/*" required>
+            <button type="submit">Upload and Process</button>
+        </form>
+        
+        <div id="result" style="display:none;"></div>
+    </div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async function (event) {
+            event.preventDefault();
+            
+            const fileInput = document.getElementById('fileInput');
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    document.getElementById('result').style.display = 'block';
+                    document.getElementById('result').innerHTML = 'Prediction: ' + result.prediction;
+                } else {
+                    document.getElementById('result').style.display = 'block';
+                    document.getElementById('result').innerHTML = 'Error: ' + result.error;
+                }
+            } catch (error) {
+                document.getElementById('result').style.display = 'block';
+                document.getElementById('result').innerHTML = 'Error: ' + error.message;
+            }
+        });
+    </script>
+</body>
+</html> -->
