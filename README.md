@@ -1,4 +1,4 @@
-# NeuroInsight : A GNN + VLM + XAI Framework for 3D MRI Analysis and QnA
+# 🧠 NeuroInsight : A GNN + VLM + XAI Framework for 3D MRI Analysis & QnA
 *A Graph Neural Network + Multimodal AI System for Brain Tumor Segmentation and Interpretation*
 
 ---
