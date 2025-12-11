@@ -10,8 +10,9 @@ import networkx as nx
 import torch_geometric.utils
 import nibabel as nib
 import numpy as np
-from skimage.segmentation import slic
+from skimage.segmentation import slic, mark_boundaries
 from skimage.graph import rag_mean_color
+from skimage.color import label2rgb
 from scipy.ndimage import center_of_mass
 import glob
 import os
@@ -153,8 +154,8 @@ def process_files_to_graph(flair_path, seg_path=None, is_healthy=False, tumor_th
         train_mask, val_mask, test_mask = _split(len(node_ids))
         data.train_mask, data.val_mask, data.test_mask = train_mask, val_mask, test_mask
 
-    # Return both the graph and the original image data
-    return data, flair_data
+    # Store supervoxels and node_ids for overlay mapping
+    return data, flair_data, supervoxels, node_ids
 
 # ===================================================================
 # PART 3: YOUR GNN INFERENCE PIPELINE (modified from 'Part 4' script)
@@ -165,14 +166,14 @@ def get_gnn_pipeline_results(flair_path, model, device, process_fn):
     This replaces the GNNExplainer part with the text summary, which
     is more useful for LLaVA.
     """
-    st.write("🧠 [GNN] Step 1/3: Preprocessing NIfTI to Graph...")
+    st.write("🧠 [GNN] Step 1/4: Preprocessing NIfTI to Graph...")
     try:
-        data, flair_data_3d = process_fn(flair_path, seg_path=None, is_healthy=False)
+        data, flair_data_3d, supervoxels_3d, node_ids = process_fn(flair_path, seg_path=None, is_healthy=False)
     except Exception as e:
         st.error(f"Error during preprocessing: {e}")
-        return None, None, None
+        return None, None, None, None
 
-    st.write("🧠 [GNN] Step 2/3: Running GNN model for segmentation...")
+    st.write("🧠 [GNN] Step 2/4: Running GNN model for segmentation...")
     with torch.no_grad():
         model.eval()
         data = data.to(device)
@@ -235,7 +236,12 @@ def get_gnn_pipeline_results(flair_path, model, device, process_fn):
             except Exception as e:
                 st.warning(f"Could not explain node {node_idx}: {e}")
                 continue
+        
+        # Create SLIC overlay with explained nodes highlighted
+        explained_node_indices = [exp['node_idx'] for exp in explanations]
+        slic_overlay = create_slic_overlay(flair_data_3d, supervoxels_3d, all_predicted_labels, node_ids, explained_node_indices)
     else:
+        slic_overlay = create_slic_overlay(flair_data_3d, supervoxels_3d, all_predicted_labels, node_ids)
         st.info("No tumor nodes found to explain.")
     
     # --- Generate Classification Summary ---
@@ -262,13 +268,74 @@ def get_gnn_pipeline_results(flair_path, model, device, process_fn):
     summary_lines.append(f"**Total Tumor Nodes (1, 2, 4): {tumor_nodes} ({ (tumor_nodes / total_nodes) * 100:.2f}%)**")
     
     text_summary = "\n".join(summary_lines)
-    return text_summary, flair_data_3d, explanations
+    return text_summary, flair_data_3d, explanations, slic_overlay
 
 # ===================================================================
 # PART 4: IMAGE & LLAVA CHAT HELPERS
 # ===================================================================
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llava:7b-v1.6-vicuna-q2_K" # Or your specific LLaVA model
+
+def create_slic_overlay(flair_data_3d, supervoxels_3d, predictions, node_ids, explained_nodes=None):
+    """
+    Create SLIC grid overlay with tumor supervoxels highlighted
+    """
+    # Find best slice
+    variances = [np.var(flair_data_3d[:, :, i]) for i in range(flair_data_3d.shape[2])]
+    best_slice_idx = np.argmax(variances)
+    
+    slice_2d = flair_data_3d[:, :, best_slice_idx]
+    supervoxels_2d = supervoxels_3d[:, :, best_slice_idx]
+    
+    # Normalize slice to grayscale
+    p2, p98 = np.percentile(slice_2d, (2, 98))
+    slice_2d = np.clip(slice_2d, p2, p98)
+    slice_norm = (slice_2d - slice_2d.min()) / (slice_2d.max() - slice_2d.min())
+    
+    # Start with grayscale base
+    slice_rgb = np.zeros((*slice_2d.shape, 3))
+    slice_rgb[:, :, 0] = slice_norm
+    slice_rgb[:, :, 1] = slice_norm  
+    slice_rgb[:, :, 2] = slice_norm
+    
+    # Color tumor supervoxels with bright colors
+    color_map = {
+        1: [1.0, 0.0, 0.0],  # Bright Red - Necrotic Core
+        2: [1.0, 1.0, 0.0],  # Bright Yellow - Edema  
+        4: [0.0, 1.0, 0.0]   # Bright Green - Enhancing Tumor
+    }
+    
+    # Map predictions to actual supervoxel IDs
+    for i, pred_class in enumerate(predictions):
+        if i < len(node_ids):
+            sv_id = node_ids[i]  # Use actual supervoxel ID from graph construction
+            pred_val = pred_class.item()
+            
+            if pred_val in color_map:
+                mask = supervoxels_2d == sv_id
+                if mask.any():  # Only color if supervoxel exists in this slice
+                    color = color_map[pred_val]
+                    slice_rgb[mask] = color  # Assign all 3 channels at once
+    
+    # Add SLIC boundaries in white
+    slice_with_boundaries = mark_boundaries(slice_rgb, supervoxels_2d, color=(1, 1, 1), mode='thick')
+    
+    # Highlight explained nodes if provided
+    if explained_nodes:
+        for node_idx in explained_nodes:
+            if node_idx < len(node_ids):
+                sv_id = node_ids[node_idx]
+                mask = supervoxels_2d == sv_id
+                if mask.any():
+                    # Add cyan border for explained nodes
+                    boundary_mask = mark_boundaries(np.zeros_like(supervoxels_2d), supervoxels_2d == sv_id, color=(0, 1, 1), mode='thick')
+                    cyan_mask = boundary_mask > 0
+                    if cyan_mask.ndim == 3:
+                        cyan_mask = cyan_mask.any(axis=2)
+                    slice_with_boundaries[cyan_mask] = [0, 1, 1]
+    
+    overlay_uint8 = (np.clip(slice_with_boundaries, 0, 1) * 255).astype(np.uint8)
+    return np.rot90(overlay_uint8)
 
 def get_2d_slice(flair_data_3d):
     """
@@ -442,7 +509,6 @@ def call_ollama(prompt, image_b64, gnn_summary):
 # PART 5: MODEL LOADING
 # ===================================================================
 
-
 # ===================================================================
 # PART 6: STREAMLIT UI
 # ===================================================================
@@ -503,7 +569,7 @@ with col1:
 
         try:
             with st.spinner("Running GNN Pipeline..."):
-                text_summary, flair_data_3d, explanations = get_gnn_pipeline_results(
+                text_summary, flair_data_3d, explanations, slic_overlay = get_gnn_pipeline_results(
                     flair_path=tmp_path,
                     model=model,
                     device=device,
@@ -520,7 +586,8 @@ with col1:
                     "summary": text_summary,
                     "image_np": slice_2d_np,
                     "image_b64": image_b64,
-                    "explanations": explanations
+                    "explanations": explanations,
+                    "slic_overlay": slic_overlay
                 }
                 st.session_state.messages = []
 
@@ -536,11 +603,27 @@ with col1:
         results = st.session_state.gnn_results
         st.subheader("Analysis Results")
         
-        st.image(results["image_np"], caption="2D MRI Slice", use_column_width=True)
+        st.image(results["image_np"], caption="Original MRI Slice", use_column_width=True)
         
         with st.expander("Show GNN Summary"):
             st.markdown(results["summary"])
             
+        with st.expander("Show SLIC Grid + Tumor Overlay"):
+            if "slic_overlay" in results:
+                st.image(results["slic_overlay"], caption="SLIC Supervoxels with Tumor Classification", use_column_width=True)
+                # Show tumor detection info
+                if "explanations" in results and results["explanations"]:
+                    tumor_count = len(results["explanations"])
+                    st.write(f"**Found {tumor_count} explained tumor nodes**")
+                else:
+                    st.write("**No tumor nodes found for explanation**")
+                st.write("**Color Legend:**")
+                st.write("🔴 Red: Necrotic Core (Class 1)")
+                st.write("🟡 Yellow: Edema (Class 2)")
+                st.write("🟢 Green: Enhancing Tumor (Class 4)")
+                st.write("🔵 Cyan Border: GNN Explained Nodes")
+                st.write("⚪ White Lines: SLIC Supervoxel Boundaries")
+        
         with st.expander("Show GNN Explainer Results"):
             if "explanations" in results and results["explanations"]:
                 for i, exp in enumerate(results["explanations"]):
@@ -587,4 +670,5 @@ with col2:
                     st.markdown(response)
             
             st.session_state.messages.append({"role": "assistant", "content": response})
+
 
